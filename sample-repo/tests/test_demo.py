@@ -1,2 +1,2 @@
-def test_demo():
-    assert 2 + 2 == 4
+def test_autoheal_demo():
+    assert 1 == 2
