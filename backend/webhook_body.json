@@ -1,0 +1,1 @@
+{"action":"completed","workflow_run":{"id":35220285870,"name":"AutoHeal CI","conclusion":"failure","head_sha":"85e22d6c1e8752b6905f49ec74918fbe5b224ecd","head_branch":"main","html_url":"https://github.com/Shruti-Gorhe/autoheal-demo-repo/actions/runs/35220285870","status":"completed"},"repository":{"name":"autoheal-demo-repo","owner":{"login":"Shruti-Gorhe"}}}

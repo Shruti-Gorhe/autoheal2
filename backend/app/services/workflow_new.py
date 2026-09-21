@@ -8,8 +8,6 @@ from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
-from google.adk.errors.already_exists_error import AlreadyExistsError
-from google.adk.events import Event, EventActions
 from google.genai import types
 
 from app.observability.telemetry import agent_span
@@ -21,27 +19,6 @@ USER_ID = "autoheal-system"
 
 MAX_LOG_CHARS = 3500
 MAX_DIFF_CHARS = 2500
-
-
-def _clip(value: Any, limit: int) -> str:
-    """Keep agent context bounded while preserving both head and tail evidence."""
-    if value is None:
-        return ""
-
-    text = str(value)
-
-    if len(text) <= limit:
-        return text
-
-    head = limit // 2
-    tail = limit - head
-
-    return (
-        text[:head]
-        + "\n...[middle truncated]...\n"
-        + text[-tail:]
-    )
-
 
 _GENERATION_CONFIG = types.GenerateContentConfig(
     temperature=0.0,
@@ -90,32 +67,13 @@ pipeline_agent = Agent(
     include_contents="none",
     generate_content_config=_GENERATION_CONFIG,
     instruction="""You are the Pipeline Analysis Agent.
-
-Analyze the CI/CD pipeline using ONLY the session state provided below.
-
-IMPORTANT:
-- Do NOT call any tools.
-- Do NOT call or invent a tool named process_pipeline.
-- Do NOT execute commands.
-- Do NOT call retrieve_ci_knowledge.
-- Do NOT perform remediation.
-- Do NOT propose a fix.
-- Return ONLY valid JSON.
-
-The JSON MUST contain exactly these keys:
-status, stage, run_id, commit, branch, failure_summary
-
-Use ONLY these session variables:
+Return ONLY valid JSON with status, stage, run_id, commit, branch, failure_summary.
+Use only these session variables and do not invent information:
 scenario={scenario}
 github={github}
 logs={logs}
 diff={diff}
-
-Rules:
-- scenario=success OR github.conclusion=success means the pipeline passed.
-- Otherwise the pipeline failed.
-- Use the actual CI logs and GitHub metadata supplied above.
-- Do not invent information that is not present in the session state.""",
+Rules: scenario=success or github.conclusion=success means passed; otherwise failed.""",
     output_key="pipeline_json",
 )
 
@@ -129,19 +87,15 @@ rag_agent = Agent(
     model=_model(),
     include_contents="none",
     generate_content_config=_GENERATION_CONFIG,
-    instruction="""You are the RAG Context Agent.
-
-The application performs exactly one deterministic retrieval before this
-agent is invoked. Do NOT call any tools.
-
-Return ONLY the supplied retrieved troubleshooting context. Do not perform
-another retrieval, do not invent historical incidents, and do not treat
-historical knowledge as proof of the current incident.
-
+    instruction="""You are the RAG Retrieval Agent.
+MUST call retrieve_ci_knowledge exactly once.
+Build the query from the actual failure evidence below.
+Return only the retrieved troubleshooting context.
+Historical documents are supporting knowledge, not proof.
 scenario={scenario}
 logs={logs}
-diff={diff}
-retrieved_context={precomputed_rag_context}""",
+diff={diff}""",
+    tools=[retrieve_ci_knowledge],
     output_key="rag_context",
 )
 
@@ -274,8 +228,9 @@ validation={validation_result}""",
 # executed separately after deterministic validation.
 
 remediation_agent = SequentialAgent(
-    name="autoheal_failure_remediation_workflow",
+    name="autoheal_remediation_workflow",
     sub_agents=[
+        pipeline_agent,
         rag_agent,
         rca_agent,
         fix_agent,
@@ -284,15 +239,6 @@ remediation_agent = SequentialAgent(
 
 
 _session_service = InMemorySessionService()
-
-
-# ============================================================
-# ADK SESSION STATE PERSISTENCE
-# ============================================================
-
-async def _persist_state(session_id: str, delta: dict[str, Any]) -> None:
-    session = await _session_service.get_session(app_name=APP_NAME, user_id=USER_ID, session_id=session_id)
-    await _session_service.append_event(session, Event(invocation_id=f"autoheal-{session_id}", author="autoheal_system", actions=EventActions(state_delta=delta)))
 
 
 # ============================================================
@@ -387,89 +333,6 @@ def _fallback_rca(logs: str) -> dict[str, Any] | None:
     return None
 
 
-def _is_valid_unified_diff(patch: Any) -> bool:
-    """Return True only for a plausible unified diff accepted by our remediation path."""
-    if not isinstance(patch, str):
-        return False
-    text = patch.strip()
-    if not text:
-        return False
-    return (
-        text.startswith("diff --git ")
-        and "\n--- " in text
-        and "\n+++ " in text
-        and "\n@@" in text
-    )
-
-
-def _patch_targets_are_safe(patch: Any, rca: Any) -> bool:
-    """
-    Deterministic safety gate for an LLM-generated patch.
-
-    A structurally valid diff is not enough: every changed file must be
-    supported by the RCA, and test files are never allowed to be changed.
-    """
-    if not isinstance(patch, str) or not patch.strip():
-        return False
-
-    if not isinstance(rca, dict):
-        return False
-
-    allowed = rca.get("likely_files") or []
-    if not isinstance(allowed, list) or not allowed:
-        return False
-
-    allowed = {
-        str(item).replace("\\", "/").lstrip("./")
-        for item in allowed
-    }
-
-    changed_files = []
-
-    for line in patch.splitlines():
-        if not (line.startswith("--- ") or line.startswith("+++ ")):
-            continue
-
-        path = line[4:].strip().split("\t", 1)[0]
-
-        if path in ("/dev/null", "dev/null"):
-            continue
-
-        path = path.replace("\\", "/")
-
-        if path.startswith("a/") or path.startswith("b/"):
-            path = path[2:]
-
-        path = path.lstrip("./")
-        changed_files.append(path)
-
-    if not changed_files:
-        return False
-
-    for path in changed_files:
-        lower = path.lower()
-        filename = lower.rsplit("/", 1)[-1]
-
-        # Never let AutoHeal modify tests.
-        if (
-            "/tests/" in f"/{lower}/"
-            or filename.startswith("test_")
-            or filename.endswith("_test.py")
-        ):
-            return False
-
-        # Every changed file must be supported by the RCA.
-        if not any(
-            path == candidate
-            or path.endswith("/" + candidate)
-            or candidate.endswith("/" + path)
-            for candidate in allowed
-        ):
-            return False
-
-    return True
-
-
 def _fallback_fix(logs: str, rca: Any) -> dict[str, Any] | None:
     """Provide a deterministic candidate for the bundled calculator demo only."""
     if (
@@ -478,9 +341,9 @@ def _fallback_fix(logs: str, rca: Any) -> dict[str, Any] | None:
         and isinstance(rca, dict)
         and rca.get("likely_files")
     ):
-        patch = """diff --git a/calculator.py b/calculator.py
---- a/calculator.py
-+++ b/calculator.py
+        patch = """diff --git a/sample-repo/calculator.py b/sample-repo/calculator.py
+--- a/sample-repo/calculator.py
++++ b/sample-repo/calculator.py
 @@ -1,2 +1,2 @@
  def add(a, b):
 -    return a - b
@@ -501,9 +364,6 @@ def _fallback_fix(logs: str, rca: Any) -> dict[str, Any] | None:
 def _build_result(
     state: dict[str, Any],
     session,
-    rca_override: dict[str, Any] | None = None,
-    fix_override: dict[str, Any] | None = None,
-    validation_override: Any = None,
 ) -> dict[str, Any]:
 
     s = session.state or {}
@@ -512,9 +372,13 @@ def _build_result(
         s.get("pipeline_json", "")
     )
 
-    rca = rca_override if rca_override is not None else _json_or_text(s.get("rca_json", ""))
+    rca = _json_or_text(
+        s.get("rca_json", "")
+    )
 
-    fix = fix_override if fix_override is not None else _json_or_text(s.get("fix_json", ""))
+    fix = _json_or_text(
+        s.get("fix_json", "")
+    )
 
     release = _json_or_text(
         s.get("release_json", "")
@@ -540,12 +404,8 @@ def _build_result(
     if not isinstance(rca, dict):
         rca = {}
 
-    build_logs = str(s.get("logs", state.get("logs", "")))
-    fallback = _fallback_rca(build_logs)
-    if fallback:
-        rca = fallback
-    elif not rca.get("evidence") or not rca.get("likely_files"):
-        fallback = _fallback_rca(build_logs)
+    if not rca.get("evidence") or not rca.get("likely_files"):
+        fallback = _fallback_rca(str(s.get("logs", state.get("logs", ""))))
         if fallback:
             rca = fallback
 
@@ -560,9 +420,9 @@ def _build_result(
             "validation_plan": "",
         }
 
-    if not _is_valid_unified_diff(fix.get("patch")):
+    if not fix.get("patch"):
         fallback_fix = _fallback_fix(
-            build_logs,
+            str(s.get("logs", state.get("logs", ""))),
             rca,
         )
         if fallback_fix:
@@ -589,25 +449,8 @@ def _build_result(
         decision == "HUMAN_REVIEW",
     )
 
-    # Safety invariant: a failed original pipeline cannot be represented
-    # as an automatic release unless real validation passed.
-    original_failed = pipeline.get("status") == "failed"
-    validation = validation_override if validation_override is not None else s.get("validation_result", {})
-    if not isinstance(validation, dict):
-        validation = {}
-    validation_passed = (
-        validation.get("success") is True
-        and validation.get("passed") is True
-    )
-    if original_failed and not validation_passed:
-        decision = "HUMAN_REVIEW"
-        hitl_required = True
-
     return {
         **state,
-
-        # Keep both API validation fields synchronized.
-        "validation_result": validation,
 
         "pipeline": pipeline,
 
@@ -620,7 +463,10 @@ def _build_result(
 
         "fix": fix,
 
-        "validation": validation,
+        "validation": s.get(
+            "validation_result",
+            {},
+        ),
 
         "decision": decision,
 
@@ -639,7 +485,7 @@ def _build_result(
 # WORKFLOW INVOCATION
 # ============================================================
 
-async def invoke_workflow_async(
+def invoke_workflow(
     state: dict[str, Any],
 ) -> dict[str, Any]:
 
@@ -656,90 +502,23 @@ async def invoke_workflow_async(
         async def run():
 
             # ------------------------------------------------
-            # Prepare bounded state before creating the ADK session
-            # ------------------------------------------------
-
-            session_state = {
-                **state,
-                "logs": _clip(state.get("logs", ""), MAX_LOG_CHARS),
-                "diff": _clip(state.get("diff", ""), MAX_DIFF_CHARS),
-                "validation_result": {},
-            }
-
-            # ------------------------------------------------
             # Create ADK session
             # ------------------------------------------------
 
-            try:
-                await _session_service.create_session(
-                    app_name=APP_NAME,
-                    user_id=USER_ID,
-                    session_id=pipeline_id,
-                    state=session_state,
-                )
-            except AlreadyExistsError:
-                # GitHub may redeliver the same workflow_run event. Reuse the
-                # existing in-memory ADK session instead of failing the webhook.
-                existing_session = await _session_service.get_session(
-                    app_name=APP_NAME,
-                    user_id=USER_ID,
-                    session_id=pipeline_id,
-                )
-                if existing_session is None:
-                    raise
-                await _persist_state(
-                    pipeline_id,
-                    session_state,
-                )
-
-            # ------------------------------------------------
-            # Phase 1: Deterministic Pipeline Classification
-            # ------------------------------------------------
-            # GitHub already provides the authoritative workflow conclusion.
-            # Do not ask the local LLM to classify it and do not expose any
-            # tool to this routing stage. This prevents local models from
-            # hallucinating a process_pipeline tool call.
-            github_state = session_state.get("github", {}) or {}
-            conclusion = str(github_state.get("conclusion", "")).lower()
-            scenario = str(session_state.get("scenario", state.get("scenario", ""))).lower()
-
-            pipeline_status = (
-                "success"
-                if scenario == "success" or conclusion == "success"
-                else "failed"
-            )
-
-            pipeline_result = {
-                "status": pipeline_status,
-                "stage": "AutoHeal",
-                "run_id": str(github_state.get("run_id", pipeline_id)),
-                "commit": str(github_state.get("head_sha", "")),
-                "branch": str(github_state.get("branch", "")),
-                "failure_summary": (
-                    None
-                    if pipeline_status == "success"
-                    else _clip(
-                        session_state.get("logs", state.get("logs", "")),
-                        1200,
-                    )
-                ),
-            }
-
-            await _persist_state(
-                pipeline_id,
-                {
-                    "pipeline_json": json.dumps(pipeline_result),
-                },
-            )
-
-            session = await _session_service.get_session(
+            await _session_service.create_session(
                 app_name=APP_NAME,
                 user_id=USER_ID,
                 session_id=pipeline_id,
+                state={
+                    **state,
+                    "validation_result": {},
+                },
             )
-            session_state = session.state or {}
 
-            # User message used only by the remediation/release agents.
+            # ------------------------------------------------
+            # User message
+            # ------------------------------------------------
+
             content = types.Content(
                 role="user",
                 parts=[
@@ -753,74 +532,13 @@ async def invoke_workflow_async(
             )
 
             # ------------------------------------------------
-            # TRUE SUCCESS SHORT-CIRCUIT
+            # Phase 1:
+            # Pipeline -> RAG -> RCA -> Fix
             # ------------------------------------------------
-            # Do not run RAG, RCA, Fix, deterministic remediation,
-            # or HITL when the original CI pipeline passed.
-            if pipeline_result.get("status") == "success":
-                validation_result = {
-                    "attempted": False,
-                    "patch_applied": False,
-                    "tests_passed": True,
-                    "success": True,
-                    "passed": True,
-                    "reason": "Original pipeline passed; remediation was not required.",
-                }
 
-                release_result = {
-                    "decision": "APPROVED_FOR_RELEASE",
-                    "rationale": "Original CI pipeline passed; no remediation or human approval is required.",
-                    "hitl_required": False,
-                }
-
-                await _persist_state(
-                    pipeline_id,
-                    {
-                        "validation_result": validation_result,
-                        "release_json": json.dumps(release_result),
-                        "decision": "APPROVED_FOR_RELEASE",
-                        "hitl_required": False,
-                    },
-                )
-
-                session = await _session_service.get_session(
-                    app_name=APP_NAME,
-                    user_id=USER_ID,
-                    session_id=pipeline_id,
-                )
-
-                return _build_result(
-                    state,
-                    session,
-                    rca_override={},
-                    fix_override={},
-                    validation_override=validation_result,
-                )
-
-            # ------------------------------------------------
-            # Phase 1B: FAILURE REMEDIATION
-            # ------------------------------------------------
-            # Pipeline Agent has already run. Only failed pipelines continue
-            # into RAG -> RCA -> Fix.
-            #
-            # Retrieval is deterministic infrastructure. Perform exactly one
-            # local RAG lookup and persist its fixed result. The ADK RAG agent
-            # consumes that result and has no retrieval tool, preventing loops.
-            rag_query = (
-                "Current CI failure troubleshooting. "
-                f"scenario={session_state.get('scenario', '')} "
-                f"logs={_clip(session_state.get('logs', ''), 1800)} "
-                f"diff={_clip(session_state.get('diff', ''), 1200)}"
-            )
-            with agent_span("rag-retrieval", query=rag_query[:500]) as rag_span:
-                rag_results = rag.retrieve(rag_query)
-                rag_context = rag.format_context(rag_results)
-                rag_span.set_attribute("rag.result_count", str(len(rag_results)))
-
-            await _persist_state(
-                pipeline_id,
-                {"precomputed_rag_context": rag_context},
-            )
+            # Keep the ADK context small for local Ollama execution.
+            session.state["logs"] = _clip(session.state.get("logs", ""), MAX_LOG_CHARS)
+            session.state["diff"] = _clip(session.state.get("diff", ""), MAX_DIFF_CHARS)
 
             remediation_runner = Runner(
                 agent=remediation_agent,
@@ -855,80 +573,6 @@ async def invoke_workflow_async(
             )
 
             # ------------------------------------------------
-            # Normalize RCA/Fix BEFORE remediation.
-            # The LLM may return a historical-incident summary or an
-            # unusable patch. The current CI logs remain authoritative.
-            # ------------------------------------------------
-
-            current_logs = str(
-                session_state.get(
-                    "logs",
-                    state.get("logs", ""),
-                )
-            )
-
-            rca_result = _json_or_text(
-                session_state.get(
-                    "rca_json",
-                    "",
-                )
-            )
-            if not isinstance(rca_result, dict):
-                rca_result = {}
-
-            # For the bundled calculator scenario, the current CI evidence is
-            # sufficiently specific to override any hallucinated LLM RCA.
-            # This keeps the demo deterministic while preserving the LLM agent
-            # for general incidents.
-            fallback_rca = _fallback_rca(current_logs)
-            if fallback_rca:
-                rca_result = fallback_rca
-                pass  # persisted below
-            elif not rca_result.get("evidence") or not rca_result.get("likely_files"):
-                fallback_rca = _fallback_rca(current_logs)
-                if fallback_rca:
-                    rca_result = fallback_rca
-                    pass  # persisted below
-
-            if not isinstance(fix_result, dict):
-                fix_result = {
-                    "proposal": str(fix_result),
-                    "patch": "",
-                    "validation_plan": "",
-                }
-
-            # Accept an LLM patch only when BOTH:
-            # 1. it is structurally a unified diff, and
-            # 2. it targets only RCA-supported implementation files.
-            #
-            # A patch that modifies tests or an unsupported file is rejected
-            # deterministically before it reaches the remediation executor.
-            proposed_patch = fix_result.get("patch")
-
-            if (
-                not _is_valid_unified_diff(proposed_patch)
-                or not _patch_targets_are_safe(proposed_patch, rca_result)
-            ):
-                fallback_fix = _fallback_fix(
-                    current_logs,
-                    rca_result,
-                )
-
-                if fallback_fix:
-                    fix_result = fallback_fix
-                else:
-                    fix_result = {
-                        **fix_result,
-                        "patch": "",
-                        "proposal": (
-                            str(fix_result.get("proposal", ""))
-                            + " Candidate patch rejected by the deterministic "
-                            "safety gate because it was malformed or targeted "
-                            "an unsupported/test file."
-                        ).strip(),
-                    }
-
-            # ------------------------------------------------
             # Deterministic remediation:
             # Fix Agent proposes -> Python applies -> tests run
             # ------------------------------------------------
@@ -937,15 +581,15 @@ async def invoke_workflow_async(
                 fix_result
             )
 
-            # Persist normalized artifacts and actual validation through ADK state_delta.
-            await _persist_state(
-                pipeline_id,
-                {
-                    "rca_json": json.dumps(rca_result),
-                    "fix_json": json.dumps(fix_result),
-                    "validation_result": json.dumps(validation_result),
-                },
-            )
+            # ------------------------------------------------
+            # Store REAL validation result in the ADK session.
+            #
+            # InMemorySessionService keeps the session object in
+            # memory, so the updated state is available to the
+            # Release Decision Agent.
+            # ------------------------------------------------
+
+            session.state["validation_result"] = validation_result
 
             # ------------------------------------------------
             # Phase 2:
@@ -995,12 +639,9 @@ async def invoke_workflow_async(
             return _build_result(
                 state,
                 session,
-                rca_override=rca_result,
-                fix_override=fix_result,
-                validation_override=validation_result,
             )
 
-        return await run()
+        return asyncio.run(run())
 
 
 # ============================================================
@@ -1008,11 +649,9 @@ async def invoke_workflow_async(
 # ============================================================
 
 class _WorkflowAdapter:
-    async def ainvoke(self, state):
-        return await invoke_workflow_async(state)
 
     def invoke(self, state):
-        return asyncio.run(invoke_workflow_async(state))
+        return invoke_workflow(state)
 
 
 workflow = _WorkflowAdapter()

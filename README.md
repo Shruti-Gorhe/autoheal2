@@ -1,124 +1,71 @@
-# AutoHeal CI/CD — Google ADK + Local Llama 3.2 + RAG + Arize Phoenix
+# AutoHeal CI/CD
 
-An end-to-end, local-first **multi-agent CI/CD failure diagnosis and remediation system**.
+> **Local-first multi-agent CI/CD failure analysis and remediation system powered by Google ADK, Llama 3.2 via Ollama, RAG, GitHub Actions, FastAPI, React, and Arize Phoenix.**
 
-AutoHeal connects GitHub Actions failures to specialized AI agents that collect CI context, retrieve relevant internal knowledge, diagnose the root cause, propose a candidate fix, validate it in isolation, and produce a release decision with Human-in-the-Loop (HITL) controls.
+AutoHeal CI/CD is an AI-assisted DevOps system designed to analyze failed CI/CD pipelines, retrieve relevant troubleshooting knowledge, identify likely root causes, generate a constrained remediation patch, validate that patch inside an isolated workspace, and make a release decision with a Human-in-the-Loop (HITL) gate.
 
-## 1. Technology Stack
-
-| Layer | Technology |
-|---|---|
-| Agent framework | Google ADK |
-| Orchestration | ADK `SequentialAgent` |
-| LLM | Llama 3.2 |
-| Local model runtime | Ollama |
-| LLM integration | LiteLLM |
-| Backend | FastAPI |
-| Frontend | React + Vite |
-| RAG | Sentence Transformers + lexical fallback |
-| Knowledge base | Local Markdown |
-| Observability | Arize Phoenix |
-| Telemetry | OpenTelemetry / OpenInference |
-| CI | GitHub Actions |
-| Integration | GitHub webhook |
-| Validation | Isolated test execution |
-| Safety | HITL |
-| Cost model | Local-first; no paid LLM API required |
+The project is designed to run locally with free/open tooling wherever possible. The LLM is served locally through **Ollama**, so the core workflow does not require a paid hosted LLM API.
 
 ---
 
-## 2. End-to-End Architecture
+## Table of Contents
+
+1. [Project Overview](#project-overview)
+2. [Problem Statement](#problem-statement)
+3. [Goals](#goals)
+4. [Key Features](#key-features)
+5. [High-Level Architecture](#high-level-architecture)
+6. [End-to-End Workflow](#end-to-end-workflow)
+7. [Agent Architecture](#agent-architecture)
+8. [Detailed Working](#detailed-working)
+9. [RAG Pipeline](#rag-pipeline)
+10. [RCA Workflow](#rca-workflow)
+11. [Fix Generation and Safety](#fix-generation-and-safety)
+12. [Isolated Validation](#isolated-validation)
+13. [Release Decision and HITL](#release-decision-and-hitl)
+14. [GitHub Actions Integration](#github-actions-integration)
+15. [Webhook Flow](#webhook-flow)
+16. [Observability with Arize Phoenix](#observability-with-arize-phoenix)
+17. [RAG Evaluation](#rag-evaluation)
+18. [Frontend](#frontend)
+19. [Backend API](#backend-api)
+20. [Project Structure](#project-structure)
+21. [Technology Stack](#technology-stack)
+22. [Prerequisites](#prerequisites)
+23. [Installation](#installation)
+24. [Environment Configuration](#environment-configuration)
+25. [Running the System](#running-the-system)
+26. [Testing the Local Pipeline](#testing-the-local-pipeline)
+27. [Testing the GitHub Webhook](#testing-the-github-webhook)
+28. [Frontend Workflow](#frontend-workflow)
+29. [Phoenix Workflow](#phoenix-workflow)
+30. [Security and Safety Controls](#security-and-safety-controls)
+31. [Failure Scenarios](#failure-scenarios)
+32. [Example AutoHeal Run](#example-autoheal-run)
+33. [Troubleshooting](#troubleshooting)
+34. [Future Improvements](#future-improvements)
+35. [Limitations](#limitations)
+36. [License](#license)
+
+---
+
+# Project Overview
+
+Traditional CI/CD pipelines can identify that a build or test job failed, but diagnosing the failure and deciding what to do next often requires a developer to inspect logs manually.
+
+AutoHeal CI/CD adds an AI-assisted remediation layer after a pipeline failure:
 
 ```text
-Developer
-   |
-   v
-GitHub Push / PR
-   |
-   v
 GitHub Actions
-   |
-   | workflow_run failure
-   v
-GitHub Webhook
-   |
-   v
-FastAPI Backend :8000
-   |
-   v
-Google ADK SequentialAgent
-   |
-   +--> Pipeline Agent
-   |       |
-   |       +--> workflow metadata
-   |       +--> real CI logs
-   |       +--> commit/diff context
-   |
-   +--> RAG Agent
-   |       |
-   |       +--> local runbooks
-   |       +--> historical incidents
-   |       +--> safety guidance
-   |
-   +--> RCA Agent
-   |       |
-   |       +--> Llama 3.2 via Ollama
-   |       +--> evidence-based diagnosis
-   |
-   +--> Fix Agent
-   |       |
-   |       +--> candidate remediation
-   |
-   +--> Isolated Testing
-   |       |
-   |       +--> validate candidate fix
-   |
-   +--> Release Decision Agent
-           |
-           +--> risk assessment
-           +--> HITL gate
-           |
-           +--> Approve -> controlled PR/release
-           +--> Reject  -> escalate
-
-Observability:
-Agents -> OpenTelemetry/OpenInference -> Arize Phoenix :6006
-
-Frontend:
-React/Vite :5173 -> FastAPI :8000
-```
-
-### Local services
-
-```text
-React/Vite       http://localhost:5173
-FastAPI          http://localhost:8000
-FastAPI Swagger  http://localhost:8000/docs
-Ollama           http://localhost:11434
-Phoenix          http://localhost:6006
-```
-
----
-
-## 3. Why Google ADK?
-
-The current edition uses **Google ADK, not LangGraph**.
-
-ADK handles:
-
-- agent definitions
-- agent instructions
-- sequential orchestration
-- execution through an ADK Runner/session
-- coordination of the specialized agents
-
-The workflow is:
-
-```text
+      |
+      v
+Webhook
+      |
+      v
 Pipeline Agent
       |
       v
-RAG Agent
+RAG Retrieval
       |
       v
 RCA Agent
@@ -127,507 +74,1242 @@ RCA Agent
 Fix Agent
       |
       v
+Isolated Validation
+      |
+      v
 Release Decision Agent
+      |
+      v
+Human-in-the-Loop
 ```
 
-The FastAPI layer uses a workflow adapter so the frontend/API can trigger the complete ADK execution without knowing the orchestration internals.
+The system deliberately separates:
+
+- failure detection
+- knowledge retrieval
+- root-cause analysis
+- fix generation
+- patch safety
+- isolated validation
+- release decision
+- human approval
+- observability
+
+This separation makes the workflow easier to inspect, test, and extend.
 
 ---
 
-## 4. Why Llama 3.2 + Ollama?
+# Problem Statement
 
-The project is designed to avoid a paid hosted LLM.
+A failed CI/CD run usually produces logs containing symptoms rather than a ready-made explanation.
 
-Runtime:
+For example:
 
 ```text
-Google ADK
-    |
-    v
-LiteLLM
-    |
-    v
+FAILED tests/test_calculator.py::test_add
+assert -1 == 5
+```
+
+A developer must determine:
+
+1. What actually failed?
+2. Which source file is responsible?
+3. Is the failure caused by code, dependency, configuration, or environment?
+4. Is there historical troubleshooting knowledge that can help?
+5. What is the smallest safe fix?
+6. Does the proposed fix actually work?
+7. Should the release continue?
+8. Does a human need to approve the change?
+
+AutoHeal automates these analysis steps while keeping the final release decision controllable.
+
+---
+
+# Goals
+
+## Primary goals
+
+- Process real GitHub Actions workflow runs.
+- Retrieve real CI logs.
+- Identify likely root causes.
+- Use RAG to retrieve relevant troubleshooting knowledge.
+- Generate a minimal remediation patch.
+- Prevent modification of test files by the Fix Agent.
+- Apply the patch only to an isolated workspace.
+- Execute the configured test command against the isolated workspace.
+- Separate patch application from test success.
+- Require HITL review when appropriate.
+- Record agent activity through OpenTelemetry/Phoenix.
+- Provide RAG evaluation metrics.
+- Provide a React dashboard for the complete workflow.
+
+## Design principles
+
+### Local-first
+
+The core LLM is local:
+
+```text
 Ollama
-    |
-    v
-Llama 3.2
+  |
+  +-- Llama 3.2
 ```
 
-Default configuration:
+### Evidence-first
 
-```env
-LLM_MODEL=llama3.2
-OLLAMA_BASE_URL=http://localhost:11434
-```
+Agents should use actual CI evidence rather than inventing failure causes.
 
-Inference therefore runs locally.
+### Minimal changes
 
-No Gemini/OpenAI/Anthropic API key is required for the intended local LLM flow.
+The Fix Agent should propose the smallest change supported by the RCA.
+
+### Never modify tests
+
+The remediation path is designed to prevent the AI from "fixing" a failing test instead of fixing the implementation.
+
+### Isolated execution
+
+The candidate patch is tested in an isolated workspace rather than directly against the developer's source tree.
+
+### Human control
+
+The automated system can analyze and validate a proposed remediation without silently turning every proposal into an unrestricted release.
 
 ---
 
-## 5. Agents
+# Key Features
 
-### 5.1 Pipeline Agent
+- Multi-agent CI/CD workflow
+- Google ADK orchestration
+- Local Llama 3.2 through Ollama
+- FastAPI backend
+- React/Vite frontend
+- GitHub Actions integration
+- GitHub webhook processing
+- CI log retrieval
+- Commit diff retrieval
+- RAG troubleshooting knowledge base
+- Lexical retrieval fallback
+- RCA with evidence and confidence
+- Safe unified-diff generation
+- Patch validation
+- Isolated test execution
+- Release decision agent
+- Human-in-the-Loop approval
+- OpenTelemetry tracing
+- Arize Phoenix observability
+- RAG evaluation
+- Pipeline result dashboard
+- CI log viewer
+- Proposed patch viewer
+- Validation output viewer
 
-Collects and normalizes CI failure context.
+---
 
-Inputs may include:
-
-- workflow/pipeline ID
-- repository
-- workflow status
-- failure logs
-- commit SHA
-- source diff
-- failure scenario
-
-Typical questions:
+# High-Level Architecture
 
 ```text
-Which workflow failed?
-Which job failed?
-What is the actual failure message?
-Which commit introduced the failure?
-Which files changed?
+                              +----------------------+
+                              |     GitHub Actions   |
+                              |    CI/CD Workflow    |
+                              +----------+-----------+
+                                         |
+                                         | workflow_run
+                                         v
+                              +----------------------+
+                              |   GitHub Webhook     |
+                              |      FastAPI         |
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              |    Pipeline Agent    |
+                              |  Pipeline status +   |
+                              |     CI evidence      |
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              |  RAG Retrieval Agent |
+                              | Troubleshooting KB   |
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              |      RCA Agent       |
+                              | Root cause + evidence|
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              |      Fix Agent       |
+                              | Minimal safe diff    |
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              | Isolated Validation  |
+                              | Patch + pytest       |
+                              +----------+-----------+
+                                         |
+                                         v
+                              +----------------------+
+                              | Release Decision     |
+                              | Agent / Gate         |
+                              +----------+-----------+
+                                         |
+                            +------------+------------+
+                            |                         |
+                            v                         v
+                     HUMAN REVIEW              Release decision
+                       / HITL
 ```
 
-Output becomes the context for downstream agents.
+---
 
-### 5.2 RAG Agent
+# Runtime Architecture
 
-Retrieves relevant project knowledge from:
+The project is intended to run locally as several processes:
 
 ```text
-knowledge_base/
-├── runbooks/
-├── incidents/
-└── docs/
+Windows PC
+│
+├── Ollama
+│     └── Llama 3.2
+│
+├── FastAPI
+│     └── localhost:8000
+│
+├── Arize Phoenix
+│     └── localhost:6006
+│
+└── React + Vite
+      └── localhost:5173
 ```
 
-Examples:
+Typical startup:
 
-- CI failure triage
-- timeout handling
-- health-check failures
+```text
+Terminal 1 → Ollama
+Terminal 2 → Phoenix
+Terminal 3 → FastAPI
+Terminal 4 → React/Vite
+```
+
+---
+
+# End-to-End Workflow
+
+## Workflow A — Successful pipeline
+
+```text
+GitHub Actions
+      |
+      | conclusion = success
+      v
+Pipeline status
+      |
+      v
+Successful result
+      |
+      v
+Release decision
+      |
+      v
+No remediation required
+```
+
+A successful pipeline should not unnecessarily execute the remediation chain.
+
+---
+
+## Workflow B — Failed pipeline
+
+```text
+GitHub Actions
+      |
+      v
+workflow_run = completed
+      |
+      v
+conclusion = failure
+      |
+      v
+Fetch logs
+      |
+      v
+Fetch commit diff
+      |
+      v
+RAG retrieval
+      |
+      v
+RCA
+      |
+      v
+Fix proposal
+      |
+      v
+Safety validation
+      |
+      v
+Isolated patch application
+      |
+      v
+Run tests
+      |
+      v
+Release Decision
+      |
+      +-------------------+
+      |                   |
+      v                   v
+HUMAN_REVIEW          REJECTED /
+                      APPROVED
+```
+
+---
+
+# Agent Architecture
+
+The system contains the following logical stages.
+
+## 1. Pipeline Agent
+
+Purpose:
+
+- Understand pipeline execution evidence.
+- Determine the pipeline state.
+- Preserve the CI evidence needed by later agents.
+
+Important design constraint:
+
+```text
+The pipeline routing path is deterministic.
+```
+
+The workflow reads the GitHub workflow conclusion directly for reliable routing.
+
+This prevents an LLM from deciding whether a GitHub Actions run actually succeeded or failed.
+
+---
+
+## 2. RAG Retrieval
+
+Purpose:
+
+- Retrieve troubleshooting knowledge related to the failure.
+- Supply context to the RCA/remediation workflow.
+
+Input:
+
+```text
+scenario
+CI logs
+commit diff
+```
+
+Output:
+
+```text
+retrieved troubleshooting context
+```
+
+The application performs one deterministic retrieval before the remediation workflow.
+
+This prevents an unnecessary tool-retrieval loop.
+
+---
+
+## 3. RCA Agent
+
+Purpose:
+
+- Analyze CI evidence.
+- Identify likely root cause.
+- Provide supporting evidence.
+- Identify likely affected implementation files.
+- Assign a confidence value.
+
+Example:
+
+```json
+{
+  "summary": "The add function is performing subtraction instead of addition.",
+  "confidence": 0.99,
+  "evidence": [
+    "tests/test_calculator.py::test_add failed with assert -1 == 5.",
+    "The failing call is add(2, 3), which returned -1 instead of the expected 5."
+  ],
+  "likely_files": [
+    "calculator.py"
+  ]
+}
+```
+
+---
+
+## 4. Fix Agent
+
+Purpose:
+
+- Convert the RCA into the smallest safe code change.
+- Generate a unified diff.
+- Avoid changing tests.
+- Avoid changing unrelated files.
+
+Example:
+
+```diff
+diff --git a/calculator.py b/calculator.py
+--- a/calculator.py
++++ b/calculator.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+```
+
+The Fix Agent does not claim that the tests passed.
+
+That claim belongs to the validation stage.
+
+---
+
+## 5. Validation
+
+Purpose:
+
+- Apply the proposed patch in an isolated workspace.
+- Run the configured test command.
+- Record whether patch application succeeded.
+- Record whether test execution succeeded.
+- Record whether all tests passed.
+
+These are intentionally separate states.
+
+Example:
+
+```json
+{
+  "attempted": true,
+  "patch_applied": true,
+  "tests_passed": false,
+  "test_execution_success": true,
+  "exit_code": 1,
+  "changed_files": [
+    "calculator.py"
+  ]
+}
+```
+
+This means:
+
+```text
+Patch applied      = YES
+Tests executed     = YES
+All tests passed   = NO
+```
+
+This distinction is important.
+
+---
+
+# RAG Pipeline
+
+The RAG layer uses a local knowledge base.
+
+Conceptually:
+
+```text
+Knowledge Files
+      |
+      v
+Document Loading
+      |
+      v
+Chunking
+      |
+      v
+Retrieval
+      |
+      v
+Top-K Context
+      |
+      v
+RCA / Remediation Workflow
+```
+
+The knowledge base contains CI troubleshooting material such as:
+
+- test failures
 - dependency failures
-- remediation safety
-- architecture/RAG documentation
+- configuration failures
+- deployment failures
+- remediation guidance
 
-Flow:
+The application can use a lexical fallback when embedding-based retrieval is unavailable.
+
+Example status endpoint:
 
 ```text
-Failure context
-      |
-      v
-Retrieval query
-      |
-      v
-Sentence Transformer embedding
-      |
-      v
-Similarity search
-      |
-      v
-Relevant documents
-      |
-      v
-RCA context
+GET /api/rag/stats
 ```
 
-A lexical fallback is also available when semantic retrieval is unavailable.
+Example response:
 
-### 5.3 RCA Agent
+```json
+{
+  "knowledge_dir": "..\\knowledge_base",
+  "chunks": 7,
+  "retrieval_mode": "lexical-fallback",
+  "embedding_model": null,
+  "top_k": 4
+}
+```
 
-Combines:
+---
+
+# RCA Workflow
+
+RCA receives:
 
 ```text
 CI logs
-+ pipeline context
-+ source diff
-+ RAG context
++
+commit diff
++
+retrieved troubleshooting context
 ```
 
-and uses local Llama 3.2 to produce a structured diagnosis.
-
-Expected reasoning includes:
-
-- likely root cause
-- supporting evidence
-- confidence
-- affected component
-- recommended remediation
-
-### 5.4 Fix Agent
-
-Converts the RCA into a **candidate remediation**.
-
-The fix is not treated as automatically trusted production code.
+It then produces:
 
 ```text
+Root cause
+Confidence
+Evidence
+Likely files
+```
+
+For the sample failure:
+
+```text
+CI:
+assert -1 == 5
+
+Implementation:
+return a - b
+
+Expected:
+return a + b
+```
+
+The RCA identifies the implementation mismatch.
+
+The important architectural rule is:
+
+```text
+CI evidence → RCA → supported files
+```
+
+rather than:
+
+```text
+LLM guess → arbitrary files
+```
+
+---
+
+# Fix Generation and Safety
+
+The Fix Agent is constrained to generate a minimal unified diff.
+
+Safety controls include:
+
+## 1. Unified diff validation
+
+The patch must contain valid diff structure.
+
+## 2. File allow-list derived from RCA
+
+Changed implementation files should be supported by the RCA's `likely_files`.
+
+## 3. Test protection
+
+The remediation layer should not allow test files to be modified as part of the candidate fix.
+
+## 4. Isolated application
+
+The patch is applied to a temporary workspace.
+
+## 5. Verification
+
+Changed files are recorded after patch application.
+
+---
+
+# Isolated Validation
+
+The remediation flow uses:
+
+```text
+Original repository
+       |
+       | copy / isolated workspace
+       v
+Temporary workspace
+       |
+       v
+Apply candidate patch
+       |
+       v
+Run configured test command
+```
+
+The original source tree is not directly modified by the remediation execution path.
+
+Typical test command:
+
+```text
+python -m pytest -q
+```
+
+The result contains:
+
+```text
+patch_applied
+tests_passed
+test_execution_success
+exit_code
+stdout
+stderr
+changed_files
+workspace
+```
+
+---
+
+# Release Decision and HITL
+
+The Release Decision Agent receives:
+
+```text
+Original pipeline status
++
 RCA
- |
- v
-Fix Agent
- |
- v
-Candidate patch
- |
- v
-Isolated testing
-```
-
-### 5.5 Release Decision Agent
-
-Evaluates the result after candidate remediation.
-
-It considers:
-
-- RCA quality
-- candidate fix availability
-- isolated test result
-- risk
-- whether human approval is required
-
-The intended policy is:
-
-```text
-AI proposal
-    |
-    v
++
+Fix
++
 Validation
-    |
-    v
-Release decision
-    |
-    v
-HITL when required
-    |
-    v
-Controlled repository action
+```
+
+Possible decisions:
+
+```text
+APPROVED_FOR_RELEASE
+HUMAN_REVIEW
+REJECTED
+```
+
+A proposed patch by itself is not considered proof that the release is safe.
+
+For a failed original pipeline, the system can require:
+
+```text
+HUMAN_REVIEW
+```
+
+unless the workflow has explicit verified validation evidence supporting a different decision.
+
+The frontend exposes the HITL action:
+
+```text
+[ Approve ] [ Reject ]
+```
+
+The backend endpoint is:
+
+```text
+POST /api/pipelines/{pipeline_id}/decision
+```
+
+Example request:
+
+```json
+{
+  "action": "approve"
+}
 ```
 
 ---
 
-## 6. Isolated Testing
+# GitHub Actions Integration
 
-Candidate fixes should be tested away from the main production branch.
+The demo repository contains a GitHub Actions workflow:
 
 ```text
-Candidate Fix
-     |
-     v
-Isolated Workspace
-     |
-     v
-Test Command
-     |
-   +---+---+
-   |       |
- PASS    FAIL
-   |       |
-   v       v
-Release  Escalate
-Decision
+.github/
+└── workflows/
+    └── autoheal-ci.yml
 ```
 
-Default:
+The workflow executes the project's tests.
 
-```env
-ISOLATED_TEST_COMMAND=python -m pytest -q
+For the sample failure:
+
+```text
+tests/test_calculator.py::test_add
+tests/test_demo.py::test_autoheal_demo
 ```
 
-This is a key safety boundary.
+The intentionally broken implementation is:
+
+```python
+def add(a, b):
+    return a - b
+```
+
+The calculator test expects:
+
+```python
+assert add(2, 3) == 5
+```
+
+This creates a reproducible failure for AutoHeal.
 
 ---
 
-## 7. HITL Safety Model
+# Webhook Flow
 
-Recommended enterprise flow:
+GitHub sends a `workflow_run` event to:
 
 ```text
-CI Failure
-    |
-    v
-AI Investigation
-    |
-    v
-Candidate Fix
-    |
-    v
-Isolated Validation
-    |
-    v
-Release Decision
-    |
-    v
-Human Approval
-    |
-    +--> Approve -> Create PR / controlled release
-    |
-    +--> Reject  -> Escalate
+/api/github/webhook
 ```
 
-Avoid blindly pushing AI-generated changes directly to `main`.
+The webhook checks:
 
-HITL is especially useful for:
+```text
+event = workflow_run
+action = completed
+```
 
-- production changes
-- dependency upgrades
-- infrastructure changes
-- security-sensitive changes
-- large source modifications
-- low-confidence RCA
-- failed validation
+Only completed workflow runs are processed for the AutoHeal workflow.
+
+The backend then:
+
+1. Creates a pipeline ID.
+2. Reads the GitHub workflow result.
+3. Retrieves workflow logs.
+4. Retrieves the commit diff.
+5. Starts AutoHeal processing.
+6. Stores the initial processing state.
+7. Updates the stored pipeline result when processing completes.
+
+The webhook uses background processing so GitHub receives a quick HTTP response rather than waiting for the entire AI workflow.
 
 ---
 
-## 8. Arize Phoenix Observability
+# Cloudflare Tunnel
 
-Phoenix provides local observability across the agent workflow.
+For local webhook development, a temporary public tunnel can expose FastAPI.
+
+Example:
+
+```cmd
+cloudflared tunnel --url http://localhost:8000
+```
+
+The generated URL can be configured in GitHub:
 
 ```text
-ADK Agents
-    |
-    v
-OpenTelemetry / OpenInference
-    |
-    v
-Phoenix OTEL registration
-    |
-    v
-Arize Phoenix
-    |
-    v
+https://<tunnel-host>/api/github/webhook
+```
+
+Keep the tunnel terminal running while testing.
+
+A temporary tunnel URL can change between sessions.
+
+---
+
+# Observability with Arize Phoenix
+
+AutoHeal uses OpenTelemetry-compatible tracing with Arize Phoenix.
+
+Local Phoenix:
+
+```text
 http://localhost:6006
 ```
 
-The project traces important operations such as:
+The application registers a Phoenix tracer provider using:
 
-- workflow stages
-- agent execution
-- RAG retrieval
-- pipeline processing
-- remediation/testing stages
-
-Telemetry resources include metadata such as:
-
-- service name
-- service version
-- environment
-- Phoenix project
-- OpenInference project
-- configuration fingerprint
-
-For short local executions, immediate exporting is used so traces are visible without waiting for a batch flush.
-
-### What to inspect in Phoenix
-
-After a workflow runs, verify:
-
-```text
-Which agent ran?
-What was the execution sequence?
-How long did each stage take?
-Did RAG return results?
-Where did the workflow fail?
-Which stage produced the release decision?
+```python
+from phoenix.otel import register
 ```
 
-Phoenix should show **real AutoHeal executions**, not just prove that the Phoenix server is running.
+The workflow records spans around important operations such as:
+
+```text
+pipeline
+rag-retrieval
+rca
+fix
+validation
+release
+```
+
+Conceptually:
+
+```text
+AutoHeal Workflow
+       |
+       +---- Pipeline span
+       |
+       +---- RAG span
+       |
+       +---- RCA span
+       |
+       +---- Fix span
+       |
+       +---- Validation span
+       |
+       +---- Release span
+```
+
+This allows the workflow to be inspected at the operation level.
 
 ---
 
-## 9. Project Structure
+# RAG Evaluation
+
+The frontend includes a RAG evaluation section.
+
+The evaluation compares RCA behavior:
 
 ```text
-autoheal-phoenix/
+Without RAG
+    vs
+With RAG
+```
+
+The evaluation reports metrics such as:
+
+- dataset size
+- Recall@K
+- MRR
+- RCA keyword accuracy without RAG
+- RCA keyword accuracy with RAG
+- improvement delta
+
+Endpoint:
+
+```text
+POST /api/evaluation/run
+```
+
+The purpose is to measure whether retrieval provides useful additional context rather than assuming that RAG automatically improves the system.
+
+---
+
+# Frontend
+
+The frontend is built using:
+
+```text
+React
+Vite
+Lucide React
+```
+
+Current frontend structure:
+
+```text
+frontend/
+├── src/
+│   ├── main.jsx
+│   └── styles.css
+├── index.html
+├── package.json
+└── package-lock.json
+```
+
+The dashboard provides:
+
+### Control Center
+
+```text
+Scenario selector
+Run Pipeline
+```
+
+### Pipeline Summary
+
+```text
+Pipeline
+Run ID
+Branch
+RCA confidence
+Validation
+Decision
+```
+
+### Agent Execution
+
+```text
+Pipeline Agent
+RAG Retrieval
+RCA Agent
+Fix Agent
+Validation
+Release Decision
+```
+
+### GitHub Actions
+
+Displays:
+
+```text
+Run ID
+Branch
+Commit
+Conclusion
+Open GitHub Run
+```
+
+### RCA
+
+Displays:
+
+```text
+Confidence
+Summary
+Evidence
+Likely files
+```
+
+### RAG
+
+Displays retrieved troubleshooting context.
+
+### Fix
+
+Displays the candidate unified diff.
+
+### Validation
+
+Displays:
+
+```text
+Patch applied
+Test execution
+Tests
+Exit code
+Changed files
+Test output
+```
+
+### HITL
+
+Displays:
+
+```text
+Approve
+Reject
+```
+
+### RAG Evaluation
+
+Displays the evaluation metrics.
+
+### Phoenix
+
+Provides a link to the local Phoenix UI.
+
+---
+
+# Backend API
+
+The main API surface includes the following logical endpoints.
+
+## Run a local pipeline
+
+```text
+POST /api/pipelines/run
+```
+
+Example:
+
+```json
+{
+  "scenario": "test_failure"
+}
+```
+
+Supported scenarios:
+
+```text
+test_failure
+dependency_failure
+config_failure
+deployment_failure
+success
+```
+
+---
+
+## Get pipeline result
+
+```text
+GET /api/pipelines/{pipeline_id}
+```
+
+This returns the stored pipeline state/result.
+
+---
+
+## Human decision
+
+```text
+POST /api/pipelines/{pipeline_id}/decision
+```
+
+Example:
+
+```json
+{
+  "action": "approve"
+}
+```
+
+or:
+
+```json
+{
+  "action": "reject"
+}
+```
+
+---
+
+## GitHub webhook
+
+```text
+POST /api/github/webhook
+```
+
+Used by GitHub Actions workflow-run events.
+
+---
+
+## RAG statistics
+
+```text
+GET /api/rag/stats
+```
+
+Used to inspect retrieval configuration and knowledge-base statistics.
+
+---
+
+## RAG evaluation
+
+```text
+POST /api/evaluation/run
+```
+
+Runs the configured evaluation dataset.
+
+---
+
+## Remediation gate health
+
+```text
+GET /api/gate/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "service": "autoheal-remediation-gate"
+}
+```
+
+---
+
+# Project Structure
+
+A representative structure is:
+
+```text
+autoheal2/
 │
 ├── backend/
 │   ├── app/
-│   │   ├── agents/
-│   │   │   └── agents.py
-│   │   ├── observability/
-│   │   │   └── telemetry.py
+│   │   ├── gate/
+│   │   │   ├── __init__.py
+│   │   │   ├── models.py
+│   │   │   ├── router.py
+│   │   │   └── service.py
+│   │   │
 │   │   ├── rag/
-│   │   │   ├── ingest.py
 │   │   │   └── rag_service.py
+│   │   │
 │   │   ├── services/
+│   │   │   ├── workflow.py
 │   │   │   ├── github_service.py
-│   │   │   ├── isolated_test.py
-│   │   │   ├── llm_service.py
-│   │   │   └── workflow.py
+│   │   │   ├── remediation_service.py
+│   │   │   ├── patch_executor.py
+│   │   │   └── isolated_test.py
+│   │   │
 │   │   └── main.py
 │   │
-│   ├── evaluation/
-│   │   ├── dataset.jsonl
-│   │   ├── evaluate.py
-│   │   └── __init__.py
-│   ├── phoenix_smoke.py
-│   ├── tests.py
-│   ├── requirements.txt
-│   └── .env.example
+│   ├── knowledge_base/
+│   │   └── CI troubleshooting documents
+│   │
+│   ├── .env
+│   └── .venv/
 │
 ├── frontend/
 │   ├── src/
-│   │   ├── components/
-│   │   ├── lib/
-│   │   ├── pages/
 │   │   ├── main.jsx
 │   │   └── styles.css
+│   ├── index.html
 │   ├── package.json
-│   └── index.html
-│
-├── knowledge_base/
-│   ├── runbooks/
-│   │   ├── ci-failure-triage.md
-│   │   └── remediation-safety.md
-│   ├── incidents/
-│   │   ├── incident-timeout.md
-│   │   ├── incident-health-check.md
-│   │   └── incident-dependency.md
-│   └── docs/
-│       ├── rag.md
-│       └── architecture.md
+│   └── package-lock.json
 │
 ├── sample-repo/
+│   ├── calculator.py
 │   ├── README.md
 │   └── tests/
+│       ├── test_calculator.py
 │       └── test_demo.py
 │
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml
-│       └── autoheal-demo.yml
+│       └── autoheal-remediation-gate.yml
 │
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── REAL_FLOW.md
-│   ├── PHOENIX_TRACING.md
-│   └── ADK_MIGRATION.md
-│
-├── scripts/
-│   └── start_phoenix.ps1
-│
-└── README.md
+└── docs/
+    └── CI_CD_REMEDIATION_GATE.md
 ```
+
+The exact directory structure can evolve as the project grows.
 
 ---
 
-## 10. Important Backend Files
+# Technology Stack
 
-### `backend/app/main.py`
-
-FastAPI entry point.
-
-Responsibilities:
-
-- FastAPI application
-- API endpoints
-- workflow requests
-- GitHub webhook
-- invoking the AutoHeal workflow
-- returning workflow results
-
-### `backend/app/services/workflow.py`
-
-ADK orchestration adapter.
-
-Conceptually:
-
-```python
-root_agent = SequentialAgent(
-    name="autoheal_workflow",
-    sub_agents=[
-        pipeline_agent,
-        rag_retrieval_agent,
-        rca_agent,
-        fix_agent,
-        release_decision_agent,
-    ],
-)
-```
-
-It uses ADK components such as:
-
-```python
-Agent
-SequentialAgent
-Runner
-InMemorySessionService
-LiteLlm
-```
-
-### `backend/app/agents/agents.py`
-
-Contains the specialized agent behavior.
-
-### `backend/app/rag/rag_service.py`
-
-Handles retrieval, similarity ranking, formatting, and fallback.
-
-### `backend/app/rag/ingest.py`
-
-Prepares the local knowledge base.
-
-### `backend/app/services/llm_service.py`
-
-Model-facing service layer.
-
-### `backend/app/services/github_service.py`
-
-GitHub workflow metadata/log/diff integration.
-
-### `backend/app/services/isolated_test.py`
-
-Candidate remediation validation.
-
-### `backend/app/observability/telemetry.py`
-
-Phoenix/OpenTelemetry initialization and tracing.
+| Layer | Technology |
+|---|---|
+| Frontend | React |
+| Frontend tooling | Vite |
+| Icons | Lucide React |
+| Backend | FastAPI |
+| Agent framework | Google ADK |
+| LLM runtime | Ollama |
+| LLM | Llama 3.2 |
+| RAG | Local retrieval |
+| Embeddings | sentence-transformers when available |
+| Retrieval fallback | Lexical retrieval |
+| CI/CD | GitHub Actions |
+| GitHub integration | GitHub REST API + webhook |
+| Observability | OpenTelemetry |
+| Trace UI | Arize Phoenix |
+| Validation | pytest |
+| Environment | python-dotenv |
+| HTTP | httpx |
 
 ---
 
-## 11. Environment Variables
+# Prerequisites
 
-Create a `.env` file from:
+Install:
+
+## Python
+
+Recommended:
 
 ```text
-backend/.env.example
+Python 3.11+
 ```
 
-Important values:
+## Node.js
 
-```env
-LLM_MODEL=llama3.2
-OLLAMA_BASE_URL=http://localhost:11434
+Install a current LTS Node.js release.
 
-PHOENIX_PROJECT=autoheal-cicd
-PHOENIX_ENDPOINT=http://localhost:6006
+Verify:
 
-ADK_ENABLED=true
-
-GITHUB_TOKEN=
-GITHUB_OWNER=
-GITHUB_REPO=
-GITHUB_WEBHOOK_SECRET=
-
-ISOLATED_REPO_PATH=
-ISOLATED_TEST_COMMAND=python -m pytest -q
+```cmd
+python --version
+node --version
+npm --version
 ```
 
-Never commit secrets.
+## Ollama
+
+Install Ollama and pull the local model:
+
+```cmd
+ollama pull llama3.2
+```
+
+Verify:
+
+```cmd
+ollama list
+```
+
+Start:
+
+```cmd
+ollama serve
+```
 
 ---
 
-## 12. Windows Setup
+# Installation
 
-From CMD:
+## 1. Clone the repository
 
 ```cmd
-cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
+git clone https://github.com/Shruti-Gorhe/autoheal2.git
+cd autoheal2
+```
+
+If the repository is already present:
+
+```cmd
+cd C:\Users\shrut\Downloads\autoheal2\autoheal2
+```
+
+---
+
+# Backend Setup
+
+Open a terminal:
+
+```cmd
+cd backend
+```
+
+Create a virtual environment:
+
+```cmd
 python -m venv .venv
+```
+
+Activate:
+
+```cmd
 .venv\Scripts\activate
+```
+
+Install dependencies:
+
+```cmd
+pip install -r requirements.txt
 ```
 
 Verify:
@@ -642,113 +1324,20 @@ Expected:
 No broken requirements found.
 ```
 
-Verify ADK:
-
-```cmd
-python -c "from google.adk.agents import Agent, SequentialAgent; print('ADK OK')"
-```
-
-Verify LiteLLM:
-
-```cmd
-python -c "import litellm; print('LiteLLM OK')"
-```
-
-Verify Phoenix:
-
-```cmd
-python -c "import phoenix; print('Phoenix OK')"
-```
-
 ---
 
-## 13. Ollama Setup
+# Frontend Setup
 
-Start:
-
-```cmd
-ollama serve
-```
-
-Check models:
+Open another terminal:
 
 ```cmd
-ollama list
-```
-
-Expected:
-
-```text
-llama3.2
-```
-
-If necessary:
-
-```cmd
-ollama pull llama3.2
-```
-
-The local endpoint is:
-
-```text
-http://localhost:11434
-```
-
----
-
-## 14. Start Phoenix
-
-Open a dedicated CMD:
-
-```cmd
-cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
-.venv\Scripts\activate
-python -m phoenix.server.main serve
-```
-
-Open:
-
-```text
-http://localhost:6006
-```
-
-Keep this terminal open.
-
-For the browser, use `localhost:6006`; `0.0.0.0:6006` is not the normal browser address.
-
----
-
-## 15. Start FastAPI
-
-Open another CMD:
-
-```cmd
-cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
-.venv\Scripts\activate
-uvicorn app.main:app --reload
-```
-
-Backend:
-
-```text
-http://localhost:8000
-```
-
-Swagger:
-
-```text
-http://localhost:8000/docs
-```
-
----
-
-## 16. Start React
-
-Open another CMD:
-
-```cmd
-cd C:\Users\shrut\Downloads\autoheal2\autoheal2\frontend
+cd frontend
 npm install
+```
+
+Start Vite:
+
+```cmd
 npm run dev
 ```
 
@@ -760,15 +1349,58 @@ http://localhost:5173
 
 ---
 
-## 17. Four-Terminal Local Runtime
+# Environment Configuration
 
-### Terminal 1 — Ollama
+Create:
+
+```text
+backend/.env
+```
+
+Example:
+
+```env
+LLM_MODEL=llama3.2
+OLLAMA_BASE_URL=http://localhost:11434
+
+ISOLATED_REPO_PATH=C:\Users\shrut\Downloads\autoheal2\autoheal2\sample-repo
+ISOLATED_TEST_COMMAND=python -m pytest -q
+
+GITHUB_TOKEN=<your-token>
+GITHUB_OWNER=Shruti-Gorhe
+GITHUB_REPO=autoheal-demo-repo
+GITHUB_WEBHOOK_SECRET=<your-webhook-secret>
+```
+
+## Important
+
+Never commit:
+
+```text
+.env
+```
+
+Never paste your GitHub token into source code.
+
+A fine-grained GitHub token should be limited to the repository and permissions required by the integration.
+
+---
+
+# Running the System
+
+Use four terminals.
+
+## Terminal 1 — Ollama
 
 ```cmd
 ollama serve
 ```
 
-### Terminal 2 — Phoenix
+Keep this terminal running.
+
+---
+
+## Terminal 2 — Phoenix
 
 ```cmd
 cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
@@ -776,661 +1408,860 @@ cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
 python -m phoenix.server.main serve
 ```
 
-### Terminal 3 — FastAPI
+Open:
+
+```text
+http://localhost:6006
+```
+
+---
+
+## Terminal 3 — FastAPI
 
 ```cmd
 cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
 .venv\Scripts\activate
-uvicorn app.main:app --reload
+uvicorn app.main:app
 ```
 
-### Terminal 4 — React
+Backend:
+
+```text
+http://127.0.0.1:8000
+```
+
+---
+
+## Terminal 4 — React
 
 ```cmd
 cd C:\Users\shrut\Downloads\autoheal2\autoheal2\frontend
 npm run dev
 ```
 
----
-
-## 18. GitHub Actions Workflow
-
-A representative CI workflow:
-
-```yaml
-name: AutoHeal CI
-
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          cd backend
-          pip install -r requirements.txt
-
-      - name: Run tests
-        run: |
-          cd backend
-          pytest -q
-```
-
-This supplies the real CI failure that AutoHeal investigates.
-
----
-
-## 19. GitHub Webhook Workflow
-
-Real integration:
+Frontend:
 
 ```text
-Developer Push
-      |
-      v
-GitHub Actions
-      |
-      v
-workflow_run event
-      |
-      v
-GitHub webhook
-      |
-      v
-POST /api/github/webhook
-      |
-      v
-Pipeline Agent
-      |
-      v
-RAG -> RCA -> Fix -> Test -> Release Decision
-```
-
-The webhook can provide:
-
-- workflow metadata
-- status
-- failure logs
-- commit SHA
-- commit diff
-- repository information
-
----
-
-## 20. Local GitHub Webhook
-
-GitHub cannot directly call:
-
-```text
-localhost:8000
-```
-
-from the public internet.
-
-For local development, use an HTTPS tunnel.
-
-Conceptually:
-
-```text
-GitHub
-   |
-   | HTTPS
-   v
-Public Tunnel
-   |
-   v
-localhost:8000
-   |
-   v
-FastAPI
-```
-
-A free temporary Cloudflare Tunnel can be used.
-
-Webhook endpoint:
-
-```text
-<public-tunnel-url>/api/github/webhook
-```
-
-Use:
-
-```env
-GITHUB_WEBHOOK_SECRET=<secret>
-```
-
-and validate the webhook signature.
-
----
-
-## 21. Complete Development Workflow
-
-```text
-1. Start Ollama
-        |
-2. Start Phoenix
-        |
-3. Start FastAPI
-        |
-4. Start React
-        |
-5. Open frontend
-        |
-6. Trigger CI failure
-        |
-7. Receive GitHub workflow event
-        |
-8. Pipeline Agent collects real context
-        |
-9. RAG retrieves knowledge
-        |
-10. RCA diagnoses failure
-        |
-11. Fix Agent creates candidate remediation
-        |
-12. Isolated test validates candidate
-        |
-13. Release Decision evaluates risk
-        |
-14. HITL approves/rejects when required
-        |
-15. Controlled PR/release
-        |
-16. Inspect Phoenix traces
+http://localhost:5173
 ```
 
 ---
 
-## 22. Failure Scenarios
+# Testing the Local Pipeline
 
-The knowledge base covers examples such as:
-
-### Timeout
-
-```text
-CI timeout
-   |
-   v
-Pipeline Agent
-   |
-   v
-Timeout runbook
-   |
-   v
-RCA
-   |
-   v
-Candidate fix
-```
-
-### Health check
-
-```text
-Health check returns 503
-   |
-   v
-Health-check incident
-   |
-   v
-RCA
-   |
-   v
-Remediation
-```
-
-### Dependency
-
-```text
-Import/dependency failure
-   |
-   v
-Dependency incident
-   |
-   v
-RCA
-   |
-   v
-Candidate dependency remediation
-```
-
----
-
-## 23. Testing Strategy
-
-### Environment
-
-```cmd
-pip check
-```
-
-Must return:
-
-```text
-No broken requirements found.
-```
-
-### Package checks
-
-```cmd
-python -c "from google.adk.agents import Agent, SequentialAgent; print('ADK OK')"
-```
-
-```cmd
-python -c "import litellm; print('LiteLLM OK')"
-```
-
-```cmd
-python -c "import phoenix; print('Phoenix OK')"
-```
-
-### API
-
-Open:
-
-```text
-http://localhost:8000/docs
-```
-
-Use Swagger to inspect and exercise the available endpoints.
-
-### RAG
-
-Test queries such as:
-
-```text
-pytest timed out while waiting for health endpoint
-```
-
-```text
-health check returned 503
-```
-
-```text
-dependency import failed after package upgrade
-```
-
-Verify that relevant local knowledge is retrieved.
-
-### Agent workflow
-
-Verify execution order:
-
-```text
-Pipeline
-  -> RAG
-  -> RCA
-  -> Fix
-  -> Release Decision
-```
-
-### Phoenix
-
-Run a real workflow, then inspect:
-
-```text
-http://localhost:6006
-```
-
-Verify traces/spans for the workflow.
-
----
-
-## 24. Evaluation
-
-The evaluation directory is:
-
-```text
-backend/evaluation/
-├── dataset.jsonl
-├── evaluate.py
-└── __init__.py
-```
-
-Useful evaluation dimensions:
-
-| Dimension | Question |
-|---|---|
-| RCA accuracy | Did the agent identify the likely cause? |
-| Evidence | Was the diagnosis grounded in failure evidence? |
-| Retrieval | Was relevant knowledge returned? |
-| Fix quality | Is the remediation relevant? |
-| Validation | Did the candidate pass isolated tests? |
-| Safety | Was risky action gated? |
-| Decision | Was the release decision justified? |
-
-RAG should be evaluated on relevance and usefulness to RCA, not merely whether it returns text.
-
----
-
-## 25. Observability Evaluation
-
-Phoenix should help answer:
-
-```text
-What happened?
-Which agent handled it?
-In what order?
-How long did each stage take?
-Did RAG retrieve useful context?
-Where did execution fail?
-What release decision was produced?
-```
-
-This makes observability a first-class part of the system.
-
----
-
-## 26. Configuration Fingerprint
-
-The telemetry resource includes a configuration fingerprint.
-
-Concept:
-
-```text
-Configuration
-     |
-     v
-Fingerprint
-     |
-     v
-OTel resource attribute
-     |
-     v
-Phoenix trace
-```
-
-This helps distinguish executions produced under different:
-
-- prompts
-- model settings
-- agent configuration
-- retrieval configuration
-- application configuration
-
----
-
-## 27. Security
-
-Never commit:
-
-```text
-.env
-GITHUB_TOKEN
-GITHUB_WEBHOOK_SECRET
-```
-
-Use minimum GitHub permissions.
-
-Validate GitHub webhook signatures.
-
-Use HTTPS for the public webhook.
-
-Do not automatically execute untrusted AI-generated changes against production.
-
-Prefer:
-
-```text
-Candidate Fix
-    |
-    v
-Isolated Test
-    |
-    v
-HITL
-    |
-    v
-Pull Request
-    |
-    v
-Review / Merge
-```
-
----
-
-## 28. Why This Is Agentic AI
-
-This is not a single:
-
-```text
-User -> LLM -> Answer
-```
-
-system.
-
-It is a coordinated multi-agent workflow:
-
-```text
-Pipeline Agent
-       |
-       v
-RAG Agent
-       |
-       v
-RCA Agent
-       |
-       v
-Fix Agent
-       |
-       v
-Release Decision Agent
-       |
-       v
-HITL
-```
-
-Each agent has a focused responsibility.
-
-The system also combines:
-
-```text
-Agent reasoning
-+
-Tool/data retrieval
-+
-CI execution
-+
-Validation
-+
-Governance
-+
-Observability
-```
-
----
-
-## 29. Why RAG Matters
-
-The model receives project-specific information through retrieval:
-
-```text
-Current CI logs
-      +
-Source diff
-      +
-Internal runbooks
-      +
-Historical incidents
-      +
-Model reasoning
-      =
-Grounded RCA
-```
-
-This is more appropriate for enterprise engineering support than relying only on generic model knowledge.
-
----
-
-## 30. Why Observability Matters
-
-Agentic workflows can fail inside individual stages.
-
-Instead of only seeing:
-
-```text
-Workflow failed
-```
-
-you want:
-
-```text
-Pipeline Agent
-     |
-     | context collection
-     v
-RAG Agent
-     |
-     | retrieval
-     v
-RCA Agent
-     |
-     | diagnosis
-     v
-Fix Agent
-     |
-     | candidate remediation
-     v
-Release Decision
-```
-
-Phoenix provides a trace-oriented view of this execution.
-
----
-
-## 31. Demo / Presentation Flow
-
-### Step 1
-Start:
-
-```text
-Ollama
-Phoenix
-FastAPI
-React
-```
-
-### Step 2
 Open:
 
 ```text
 http://localhost:5173
 ```
 
-### Step 3
-Trigger a representative CI failure.
+Select:
 
-### Step 4
-Show GitHub Actions failure.
+```text
+Test failure
+```
 
-### Step 5
-Show AutoHeal receiving the workflow event.
+Click:
 
-### Step 6
-Show Pipeline Agent extracting logs/context.
+```text
+Run Pipeline
+```
 
-### Step 7
-Show RAG retrieving relevant runbook/incident.
+The expected conceptual workflow is:
 
-### Step 8
-Show RCA Agent diagnosis.
+```text
+Pipeline
+   ↓
+RAG
+   ↓
+RCA
+   ↓
+Fix
+   ↓
+Isolated Validation
+   ↓
+Release Decision
+   ↓
+HITL
+```
 
-### Step 9
-Show Fix Agent candidate remediation.
+For the sample calculator failure, the RCA should identify the subtraction/addition mismatch.
 
-### Step 10
-Show isolated validation.
+The candidate patch is:
 
-### Step 11
-Show Release Decision/HITL.
+```diff
+- return a - b
++ return a + b
+```
 
-### Step 12
+The isolated test environment should execute the configured pytest command.
+
+---
+
+# Testing the GitHub Webhook
+
+## 1. Start FastAPI
+
+```cmd
+uvicorn app.main:app
+```
+
+## 2. Start Cloudflare Tunnel
+
+```cmd
+cloudflared tunnel --url http://localhost:8000
+```
+
+Copy the generated HTTPS URL.
+
+For example:
+
+```text
+https://<generated-host>
+```
+
+## 3. GitHub webhook URL
+
+Configure:
+
+```text
+https://<generated-host>/api/github/webhook
+```
+
+## 4. GitHub webhook configuration
+
+In the repository:
+
+```text
+Settings
+→ Webhooks
+→ Add webhook
+```
+
+Configure:
+
+```text
+Payload URL:
+https://<generated-host>/api/github/webhook
+
+Content type:
+application/json
+
+Secret:
+same value as GITHUB_WEBHOOK_SECRET
+```
+
+Select the workflow-run event.
+
+Enable:
+
+```text
+Active
+```
+
+---
+
+# GitHub Workflow Test
+
+Make a harmless commit to the demo repository.
+
+Example:
+
+```cmd
+git status
+```
+
+Then:
+
+```cmd
+git add .
+git commit -m "trigger AutoHeal workflow"
+git push origin main
+```
+
+GitHub Actions runs.
+
+The webhook receives the workflow-run event.
+
+AutoHeal processes the run.
+
+The frontend can then display the resulting pipeline.
+
+---
+
+# Frontend Workflow
+
+Once the frontend is running:
+
+```text
+1. Select scenario
+        ↓
+2. Click Run Pipeline
+        ↓
+3. Backend executes workflow
+        ↓
+4. Result returned
+        ↓
+5. Dashboard updates
+```
+
+For a real GitHub run:
+
+```text
+GitHub
+  ↓
+Webhook
+  ↓
+Backend
+  ↓
+Pipeline result
+  ↓
+Frontend
+```
+
+The dashboard can display:
+
+```text
+Run ID
+Branch
+Commit
+RCA
+RAG
+Fix
+Validation
+Decision
+HITL
+```
+
+---
+
+# Phoenix Workflow
+
+Start Phoenix:
+
+```cmd
+python -m phoenix.server.main serve
+```
+
 Open:
 
 ```text
 http://localhost:6006
 ```
 
-and show the corresponding Phoenix trace.
+Run AutoHeal.
 
----
+Then inspect the corresponding trace/spans in Phoenix.
 
-## 32. Suggested Technical Explanation
-
-> AutoHeal CI/CD is a multi-agent CI/CD remediation system built using Google ADK. GitHub Actions provides the real pipeline failure context. The Pipeline Agent collects logs and metadata, the RAG Agent retrieves relevant runbooks and historical incidents from a local knowledge base, and the RCA Agent uses locally hosted Llama 3.2 through Ollama to diagnose the failure. The Fix Agent generates a candidate remediation, which is validated in an isolated environment. The Release Decision Agent then evaluates the result and routes risky changes through human approval. Arize Phoenix with OpenTelemetry provides observability across the agent workflow.
-
----
-
-## 33. Current ADK vs Previous LangGraph Edition
-
-The earlier project used LangGraph.
-
-Current edition:
+The goal is to observe the workflow as:
 
 ```text
-Google ADK
-   |
-   +-- SequentialAgent
-          |
-          +-- Pipeline Agent
-          +-- RAG Agent
-          +-- RCA Agent
-          +-- Fix Agent
-          +-- Release Decision Agent
-```
-
-The surrounding architecture remains:
-
-```text
-FastAPI
-RAG
-Ollama
-Llama 3.2
-GitHub
-Phoenix
-HITL
+AutoHeal
+├── pipeline
+├── rag-retrieval
+├── rca
+├── fix
+├── validation
+└── release
 ```
 
 ---
 
-## 34. Success Checklist
+# Security and Safety Controls
 
-The system is ready when:
+AutoHeal is designed around several safety boundaries.
 
-- [ ] Ollama is running
-- [ ] `llama3.2` is available
-- [ ] ADK imports successfully
-- [ ] LiteLLM imports successfully
-- [ ] Phoenix imports successfully
-- [ ] `pip check` reports no broken requirements
-- [ ] Phoenix runs on `localhost:6006`
-- [ ] FastAPI runs on `localhost:8000`
-- [ ] Swagger opens at `/docs`
-- [ ] React runs on `localhost:5173`
-- [ ] RAG retrieves relevant knowledge
-- [ ] ADK workflow executes
-- [ ] Llama 3.2 responds through Ollama
-- [ ] Phoenix receives workflow telemetry
-- [ ] Candidate fixes are isolated/tested
-- [ ] Release decisions can require HITL
-- [ ] GitHub Actions produces realistic failure context
-- [ ] GitHub webhook can trigger AutoHeal
+## 1. Local LLM
+
+The project uses:
+
+```text
+Ollama → Llama 3.2
+```
+
+instead of requiring a paid external LLM API.
+
+## 2. GitHub token protection
+
+Tokens belong in `.env`, not source code.
+
+## 3. Test protection
+
+The remediation path should reject patches that attempt to modify tests.
+
+## 4. RCA-supported files
+
+The patch should be restricted to files identified as relevant by RCA.
+
+## 5. Isolated workspace
+
+The candidate patch is applied outside the original working tree.
+
+## 6. Validation before release
+
+A proposed patch is not treated as proof of correctness.
+
+## 7. HITL
+
+Human approval can remain required before release.
+
+## 8. Observability
+
+Agent operations are traced for inspection.
 
 ---
 
-## 35. Quick Start
+# Failure Scenarios
+
+The project can model different failure categories.
+
+## Test failure
+
+Example:
+
+```text
+assert -1 == 5
+```
+
+Possible cause:
+
+```text
+incorrect implementation
+```
+
+---
+
+## Dependency failure
+
+Example:
+
+```text
+ModuleNotFoundError
+```
+
+Possible investigation:
+
+```text
+requirements
+environment
+dependency versions
+```
+
+---
+
+## Configuration failure
+
+Example:
+
+```text
+missing environment variable
+invalid configuration
+```
+
+---
+
+## Deployment failure
+
+Example:
+
+```text
+deployment command failed
+```
+
+The RCA should use the actual logs and retrieved context rather than assuming a single fixed cause.
+
+---
+
+# Example AutoHeal Run
+
+## 1. GitHub Actions failure
+
+```text
+FAILED tests/test_calculator.py::test_add
+assert -1 == 5
+
+FAILED tests/test_demo.py::test_autoheal_demo
+assert 1 == 2
+```
+
+---
+
+## 2. RAG
+
+The retrieval stage searches the troubleshooting knowledge base for relevant CI failure information.
+
+---
+
+## 3. RCA
+
+Example result:
+
+```text
+Summary:
+The add function is performing subtraction instead of addition.
+
+Confidence:
+99%
+
+Likely file:
+calculator.py
+```
+
+---
+
+## 4. Fix
+
+Candidate patch:
+
+```diff
+diff --git a/calculator.py b/calculator.py
+--- a/calculator.py
++++ b/calculator.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+```
+
+---
+
+## 5. Safety
+
+The system verifies:
+
+```text
+Unified diff structure
++
+Allowed target file
++
+No test modification
+```
+
+---
+
+## 6. Isolated validation
+
+The patch is applied in a temporary workspace.
+
+Tests execute:
+
+```text
+python -m pytest -q
+```
+
+A possible result:
+
+```text
+1 passed
+1 failed
+```
+
+This means:
+
+```text
+calculator test → passed
+intentional demo test → failed
+```
+
+Therefore the entire suite is not considered successful.
+
+---
+
+## 7. Release Decision
+
+The system can return:
+
+```text
+HUMAN_REVIEW
+```
+
+because the original pipeline was failed and the complete configured test suite did not pass.
+
+---
+
+## 8. Human decision
+
+The dashboard exposes:
+
+```text
+Approve
+Reject
+```
+
+The human can inspect:
+
+```text
+RCA
++
+Evidence
++
+Patch
++
+Validation
++
+CI Logs
+```
+
+before making the decision.
+
+---
+
+# Troubleshooting
+
+## Backend unavailable
+
+Frontend message:
+
+```text
+Backend unavailable. Start FastAPI on port 8000.
+```
+
+Check:
+
+```cmd
+curl http://localhost:8000
+```
+
+or open:
+
+```text
+http://127.0.0.1:8000
+```
+
+---
+
+## Ollama unavailable
+
+Check:
+
+```cmd
+ollama list
+```
+
+Start:
+
+```cmd
+ollama serve
+```
+
+Check the model:
+
+```cmd
+ollama run llama3.2
+```
+
+---
+
+## Phoenix unavailable
+
+Start:
+
+```cmd
+python -m phoenix.server.main serve
+```
+
+Then open:
+
+```text
+http://localhost:6006
+```
+
+---
+
+## Frontend blank page
+
+First inspect:
+
+```text
+F12
+→ Console
+```
+
+Look for JavaScript import/runtime errors.
+
+Also run:
+
+```cmd
+npm run build
+```
+
+---
+
+## GitHub token failure
+
+Check that `.env` contains:
+
+```env
+GITHUB_TOKEN=...
+GITHUB_OWNER=...
+GITHUB_REPO=...
+```
+
+Do not print or share the token.
+
+Verify configuration from Python without printing the token:
+
+```cmd
+python -c "from app.services.github_service import GitHubService; g=GitHubService(); print('configured:', g.configured()); print('repo:', g.repo_slug)"
+```
+
+Expected:
+
+```text
+configured: True
+repo: Shruti-Gorhe/autoheal-demo-repo
+```
+
+---
+
+## RAG fallback mode
+
+If:
+
+```text
+retrieval_mode = lexical-fallback
+```
+
+the system is still able to retrieve using the configured fallback mechanism.
+
+Check:
+
+```cmd
+curl http://localhost:8000/api/rag/stats
+```
+
+---
+
+## Patch target does not exist
+
+If validation reports:
+
+```text
+Patch target does not exist
+```
+
+check:
+
+```text
+ISOLATED_REPO_PATH
+```
+
+and verify that the isolated workspace actually contains the repository files before patch execution.
+
+---
+
+## GitHub webhook does not process
+
+Check:
+
+1. Cloudflare Tunnel is running.
+2. Payload URL is correct.
+3. Secret matches `GITHUB_WEBHOOK_SECRET`.
+4. Workflow-run events are enabled.
+5. GitHub workflow actually completed.
+6. FastAPI is running.
+7. GitHub token has access to the repository.
+
+---
+
+# Future Improvements
+
+Potential future extensions include:
+
+## Exact commit checkout
+
+Instead of relying only on a configured local repository path, create the isolated workspace from the exact GitHub commit SHA associated with the failed run.
+
+```text
+GitHub SHA
+    ↓
+Fresh isolated checkout
+    ↓
+Patch
+    ↓
+Tests
+```
+
+This makes remediation reproducible against the exact failing revision.
+
+---
+
+## Pipeline history
+
+Add a persistent run history:
+
+```text
+Run ID
+Branch
+Commit
+Status
+RCA
+Validation
+Decision
+Timestamp
+```
+
+---
+
+## Improved HITL
+
+Add:
+
+```text
+Patch preview
+RCA evidence
+Validation summary
+Approve
+Reject
+Comments
+```
+
+---
+
+## Better RAG knowledge base
+
+Expand the troubleshooting knowledge base with:
+
+```text
+test failures
+dependency failures
+Docker failures
+configuration failures
+deployment failures
+GitHub Actions failures
+Python failures
+Node.js failures
+```
+
+---
+
+## Better observability
+
+Add more span attributes:
+
+```text
+pipeline_id
+github_run_id
+commit_sha
+branch
+scenario
+rca_confidence
+rag_result_count
+changed_files
+validation_status
+release_decision
+```
+
+---
+
+## Persistent state
+
+Move from in-memory state to a persistent store for production-style operation.
+
+Possible local choices include:
+
+```text
+SQLite
+PostgreSQL
+```
+
+---
+
+## More robust remediation
+
+Future remediation can include:
+
+```text
+Retry with revised patch
+       ↓
+Re-run validation
+       ↓
+Compare validation results
+       ↓
+Escalate to HITL
+```
+
+---
+
+# Limitations
+
+This is an AI-assisted remediation prototype and should not be treated as an unrestricted autonomous production deployment system.
+
+Important limitations include:
+
+- LLM-generated RCA can be incorrect.
+- RAG retrieval can return irrelevant context.
+- A candidate patch can be syntactically valid but logically incorrect.
+- Passing tests do not prove complete correctness.
+- Local workspace state may differ from the exact GitHub runner environment.
+- The current demo uses a controlled sample repository.
+- The GitHub webhook development flow depends on a reachable tunnel.
+- In-memory workflow state is not a production persistence solution.
+- A real production deployment would require stronger isolation, authentication, authorization, secret management, concurrency control, audit storage, and release controls.
+
+---
+
+# Architecture Summary
+
+The central design can be summarized as:
+
+```text
+             CI/CD FAILURE
+                   |
+                   v
+          +------------------+
+          | Pipeline Agent   |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | RAG Retrieval    |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | RCA Agent        |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | Fix Agent        |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | Safety Checks    |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | Isolated Tests   |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | Release Decision |
+          +--------+---------+
+                   |
+                   v
+          +------------------+
+          | HITL Gate        |
+          +------------------+
+
+       Observability
+              |
+              v
+        OpenTelemetry
+              |
+              v
+       Arize Phoenix
+```
+
+---
+
+# Quick Start
+
+For the shortest path to a working local demo:
 
 ### Terminal 1
 
@@ -1451,7 +2282,7 @@ python -m phoenix.server.main serve
 ```cmd
 cd C:\Users\shrut\Downloads\autoheal2\autoheal2\backend
 .venv\Scripts\activate
-uvicorn app.main:app --reload
+uvicorn app.main:app
 ```
 
 ### Terminal 4
@@ -1464,95 +2295,66 @@ npm run dev
 Open:
 
 ```text
-Frontend: http://localhost:5173
-Backend:  http://localhost:8000
-Swagger:  http://localhost:8000/docs
-Phoenix:  http://localhost:6006
-Ollama:   http://localhost:11434
+Frontend:
+http://localhost:5173
+
+Backend:
+http://127.0.0.1:8000
+
+Phoenix:
+http://localhost:6006
+```
+
+Then select:
+
+```text
+Test failure
+```
+
+and click:
+
+```text
+Run Pipeline
 ```
 
 ---
 
-## 36. Final System
+# Project Outcome
+
+AutoHeal CI/CD demonstrates how an AI-assisted DevOps workflow can connect:
 
 ```text
-                       DEVELOPER
-                           |
-                           v
-                      GitHub Push
-                           |
-                           v
-                  +------------------+
-                  | GitHub Actions   |
-                  | CI / Tests       |
-                  +--------+---------+
-                           |
-                         failure
-                           |
-                           v
-                  +------------------+
-                  | GitHub Webhook   |
-                  +--------+---------+
-                           |
-                           v
-                  +------------------+
-                  | FastAPI Backend  |
-                  +--------+---------+
-                           |
-                           v
-                  +------------------+
-                  | Google ADK       |
-                  | SequentialAgent |
-                  +--------+---------+
-                           |
-          +----------------+----------------+
-          |                |                |
-          v                v                v
-      Pipeline            RAG              RCA
-       Agent             Agent            Agent
-          |                |                |
-          +----------------+----------------+
-                           |
-                           v
-                       Fix Agent
-                           |
-                           v
-                  Isolated Testing
-                           |
-                    +------+------+
-                    |             |
-                   PASS          FAIL
-                    |             |
-                    v             v
-             Release Decision   Escalate
-                    |
-                    v
-                   HITL
-                    |
-              +-----+-----+
-              |           |
-           Approve       Reject
-              |
-              v
-          Create PR
-              |
-              v
-        Controlled merge
-
-Observability:
-Agents -> OpenTelemetry -> Phoenix :6006
+CI/CD
+  +
+GitHub
+  +
+Multi-Agent AI
+  +
+RAG
+  +
+Root Cause Analysis
+  +
+Code Remediation
+  +
+Isolated Testing
+  +
+Release Governance
+  +
+Human-in-the-Loop
+  +
+Observability
 ```
 
-## Design Principle
+The key architectural idea is not simply to ask an LLM to "fix the error."
+
+Instead, AutoHeal separates the complete lifecycle:
 
 ```text
 Detect
   ↓
-Understand
+Retrieve
   ↓
-Retrieve knowledge
-  ↓
-Diagnose
+Analyze
   ↓
 Propose
   ↓
@@ -1560,9 +2362,10 @@ Validate
   ↓
 Decide
   ↓
-Human approval
-  ↓
-Controlled release
+Approve
 ```
 
-This provides an agentic CI/CD remediation workflow while keeping the system local-first, observable, testable, and safety-gated.
+This separation provides clearer evidence, safer remediation boundaries, and a workflow that can be observed and evaluated at each stage.
+
+---
+

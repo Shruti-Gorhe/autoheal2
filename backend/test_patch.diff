@@ -1,0 +1,7 @@
+diff --git a/sample-repo/calculator.py b/sample-repo/calculator.py
+--- a/sample-repo/calculator.py
++++ b/sample-repo/calculator.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b

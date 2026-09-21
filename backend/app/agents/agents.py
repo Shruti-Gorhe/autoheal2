@@ -1,114 +1,442 @@
-import asyncio
+import hashlib
+import hmac
 import os
-from app.observability.telemetry import agent_span
+import subprocess
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from app.services.workflow import workflow
 from app.services.github_service import GitHubService
-from app.services.llm_service import llm
-from app.services.isolated_test import validate_patch
+from app.observability.telemetry import agent_span
 from app.rag.rag_service import rag
+from evaluation.evaluate import run as run_evaluation
+from app.gate.router import router as gate_router
 
 
+app = FastAPI(
+    title="AutoHeal CI/CD",
+    version="0.3.0",
+)
+
+app.include_router(gate_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+runs = {}
 github = GitHubService()
 
 
-def pipeline_agent(state):
-    with agent_span("pipeline-agent", **{"pipeline.id": state["pipeline_id"]}) as span:
-        gh = state.get("github", {})
-        scenario = state.get("scenario", "test_failure")
-        failure = gh.get("conclusion") not in (None, "success") or scenario != "success"
-        result = {
-            "status": "failed" if failure else "passed",
-            "stage": gh.get("name") or ({
-                "test_failure": "test",
-                "dependency_failure": "build",
-                "config_failure": "health-check",
-                "deployment_failure": "deploy",
-                "success": "complete",
-            }.get(scenario, "unknown")),
-            "run_id": gh.get("run_id"),
-            "commit": gh.get("head_sha"),
-            "branch": gh.get("branch"),
-        }
-        span.set_attribute("pipeline.status", result["status"])
-        return {**state, "pipeline": result}
+class PipelineRequest(BaseModel):
+    scenario: str = "test_failure"
 
 
-def _fallback_rca(scenario):
-    evidence = {
-        "test_failure": "Recent code changed timeout behavior while tests still expect the previous timeout.",
-        "dependency_failure": "A dependency version is incompatible with the current runtime.",
-        "config_failure": "The health-check configuration points to an invalid service path.",
-        "deployment_failure": "Deployment health checks failed after the latest application change.",
-        "success": "No root cause because the pipeline passed.",
+class DecisionRequest(BaseModel):
+    action: str
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/api/health")
+def health():
+    return {
+        "status": "ok",
+        "github_configured": github.configured(),
+        "llm_provider": os.getenv("LLM_PROVIDER", "ollama"),
+        "llm_model": os.getenv("LLM_MODEL", "llama3.2"),
+        "llm_configured": __import__(
+            "app.services.llm_service",
+            fromlist=["llm"],
+        ).llm.configured,
+        "rag": rag.stats(),
     }
-    return {"summary": evidence.get(scenario, "The CI pipeline failed; inspect the supplied logs."), "confidence": 0.65, "evidence": [], "likely_files": []}
 
 
-def rag_retrieval_node(state):
-    with agent_span("rag-retrieval", **{"pipeline.id": state["pipeline_id"]}) as span:
-        query = "\n".join([
-            state.get("scenario", ""),
-            state.get("logs", "")[-10000:],
-            state.get("diff", "")[-6000:],
-        ])
-        results = rag.retrieve(query)
-        context = rag.format_context(results)
-        span.set_attribute("rag.result_count", str(len(results)))
-        span.set_attribute("rag.retrieval_mode", rag.stats()["retrieval_mode"])
-        return {**state, "rag_results": results, "rag_context": context}
+# ============================================================
+# RAG
+# ============================================================
+
+@app.get("/api/rag/stats")
+def rag_stats():
+    return rag.stats()
 
 
-def rca_agent(state):
-    with agent_span("rca-agent", **{"pipeline.id": state["pipeline_id"]}) as span:
-        scenario = state.get("scenario", "test_failure")
-        if state.get("pipeline", {}).get("status") == "passed":
-            rca = _fallback_rca("success")
-        else:
-            rca = llm.structured_rca(
-                state.get("logs", ""),
-                state.get("diff", ""),
-                state.get("github", {}),
-                state.get("rag_context", ""),
-            ) if llm.configured else {}
-            if not rca:
-                rca = _fallback_rca(scenario)
-        span.set_attribute("rca.confidence", str(rca.get("confidence", 0)))
-        span.set_attribute("llm.provider", llm.provider if llm.configured else "fallback")
-        span.set_attribute("rag.context_included", str(bool(state.get("rag_context"))))
-        return {**state, "rca": rca}
+@app.post("/api/rag/refresh")
+def rag_refresh():
+    return rag.refresh()
 
 
-def fix_agent(state):
-    with agent_span("fix-agent", **{"pipeline.id": state["pipeline_id"]}) as span:
-        scenario = state.get("scenario", "test_failure")
-        if state.get("pipeline", {}).get("status") == "passed":
-            fix = {"proposal": "No remediation required.", "patch": "", "validation": {"tests_passed": True}}
-        else:
-            patch = llm.generate_patch(state.get("rca", {}), state.get("logs", ""), state.get("diff", "")) if llm.configured else ""
-            validation = {"tests_passed": False, "valid": False, "applied": False, "output": "No LLM patch available; human review required."}
-            repo_dir = os.getenv("ISOLATED_REPO_PATH", "")
-            if patch and repo_dir and os.path.isdir(repo_dir):
-                validation = validate_patch(repo_dir, patch)
-            proposal = "LLM-generated patch validated in an isolated workspace." if patch else {
-                "test_failure": "Restore timeout to 30s or update the affected tests after validating intended behavior.",
-                "dependency_failure": "Pin the incompatible dependency to the last compatible version and rerun CI.",
-                "config_failure": "Correct the health-check path and rerun the service health check.",
-                "deployment_failure": "Rollback the latest deployment, inspect health-check logs, then retry after validation.",
-            }.get(scenario, "Inspect the failure and rerun CI.")
-            fix = {"proposal": proposal, "patch": patch, "validation": validation}
-        span.set_attribute("fix.tests_passed", str(fix["validation"].get("tests_passed", False)))
-        return {**state, "fix": fix}
+# ============================================================
+# EVALUATION
+# ============================================================
+
+@app.post("/api/evaluation/run")
+def evaluation_run():
+    return run_evaluation()
 
 
-def release_agent(state):
-    with agent_span("release-decision-agent", **{"pipeline.id": state["pipeline_id"]}) as span:
-        pipeline = state.get("pipeline", {})
-        validation = state.get("fix", {}).get("validation", {})
-        if pipeline.get("status") == "passed":
-            decision = "DEPLOY"
-        elif validation.get("tests_passed"):
-            decision = "HUMAN_REVIEW"
-        else:
-            decision = "HUMAN_REVIEW"
-        hitl = {"status": "pending" if decision == "HUMAN_REVIEW" else "not_required"}
-        span.set_attribute("release.decision", decision)
-        return {**state, "decision": decision, "hitl": hitl}
+@app.get("/api/evaluation/results")
+def evaluation_results():
+    from pathlib import Path
+    import json
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "evaluation"
+        / "results"
+        / "evaluation_summary.json"
+    )
+
+    if not path.exists():
+        return {
+            "status": "not_run",
+            "message": "Run POST /api/evaluation/run first.",
+        }
+
+    return json.loads(path.read_text())
+
+
+# ============================================================
+# PIPELINE RESULT
+# ============================================================
+
+@app.get("/api/pipelines/{pipeline_id}")
+def get_pipeline(pipeline_id: str):
+    if pipeline_id not in runs:
+        raise HTTPException(
+            404,
+            "Pipeline not found",
+        )
+
+    return runs[pipeline_id]
+
+
+# ============================================================
+# LOCAL PIPELINE RUN
+# ============================================================
+
+@app.post("/api/pipelines/run")
+def run_pipeline(req: PipelineRequest):
+    allowed = {"success", "test_failure"}
+
+    if req.scenario not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"scenario must be one of {sorted(allowed)}",
+        )
+
+    pipeline_id = f"demo-{uuid.uuid4().hex[:8]}"
+
+    # ------------------------------------------------------------
+    # LOCAL SAMPLE-REPO CI EXECUTION
+    # ------------------------------------------------------------
+    sample_repo = (
+        Path(__file__).resolve().parents[2]
+        / "sample-repo"
+    )
+
+    logs = ""
+
+    if req.scenario == "test_failure":
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", "-q"],
+                cwd=str(sample_repo),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            logs = (
+                "COMMAND: python -m pytest -q\n"
+                f"EXIT CODE: {result.returncode}\n\n"
+                "STDOUT:\n"
+                f"{result.stdout}\n\n"
+                "STDERR:\n"
+                f"{result.stderr}"
+            )
+
+        except subprocess.TimeoutExpired as exc:
+            logs = (
+                "COMMAND: python -m pytest -q\n"
+                "STATUS: TIMEOUT\n"
+                f"STDOUT:\n{exc.stdout or ''}\n"
+                f"STDERR:\n{exc.stderr or ''}"
+            )
+
+        except Exception as exc:
+            logs = (
+                "COMMAND: python -m pytest -q\n"
+                "STATUS: EXECUTION_ERROR\n"
+                f"ERROR: {exc}"
+            )
+
+    else:
+        logs = (
+            "COMMAND: local success scenario\n"
+            "STATUS: success\n"
+            "No test failure was simulated."
+        )
+
+    # ------------------------------------------------------------
+    # COLLECT SAMPLE REPO DIFF
+    # ------------------------------------------------------------
+    diff = ""
+
+    try:
+        git_diff = subprocess.run(
+            ["git", "diff", "--", "."],
+            cwd=str(sample_repo),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        diff = git_diff.stdout
+
+    except Exception:
+        diff = ""
+
+    # ------------------------------------------------------------
+    # RUN ADK AUTOHEAL WORKFLOW
+    # ------------------------------------------------------------
+    result = workflow.invoke(
+        {
+            "pipeline_id": pipeline_id,
+            "scenario": req.scenario,
+            "github": {},
+            "logs": logs,
+            "diff": diff,
+            "validation_result": {},
+        }
+    )
+
+    return result
+
+# ============================================================
+# GITHUB ACTIONS WEBHOOK
+# ============================================================
+
+@app.post("/api/github/webhook")
+async def github_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None),
+    x_github_event: str | None = Header(default=None),
+):
+
+    body = await request.body()
+
+    # --------------------------------------------------------
+    # Verify GitHub webhook signature
+    # --------------------------------------------------------
+
+    secret = os.getenv(
+        "GITHUB_WEBHOOK_SECRET",
+        "",
+    )
+
+    if secret:
+
+        expected = (
+            "sha256="
+            + hmac.new(
+                secret.encode(),
+                body,
+                hashlib.sha256,
+            ).hexdigest()
+        )
+
+        if (
+            not x_hub_signature_256
+            or not hmac.compare_digest(
+                expected,
+                x_hub_signature_256,
+            )
+        ):
+            raise HTTPException(
+                401,
+                "Invalid webhook signature",
+            )
+
+    # --------------------------------------------------------
+    # Parse GitHub event
+    # --------------------------------------------------------
+
+    payload = await request.json()
+
+    if x_github_event != "workflow_run":
+        return {
+            "ignored": True,
+            "event": x_github_event,
+        }
+
+    action = payload.get("action")
+
+    run = payload.get(
+        "workflow_run",
+        {},
+    )
+
+    if (
+        action not in (None, "completed")
+        or run.get("status") != "completed"
+    ):
+        return {
+            "ignored": True,
+            "reason": "workflow run is not completed",
+        }
+
+    # --------------------------------------------------------
+    # Create AutoHeal pipeline ID
+    # --------------------------------------------------------
+
+    pipeline_id = f"gh-{run.get('id')}"
+
+    scenario = (
+        "success"
+        if run.get("conclusion") == "success"
+        else "test_failure"
+    )
+
+    # --------------------------------------------------------
+    # Start Phoenix trace
+    # --------------------------------------------------------
+
+    with agent_span(
+        "github-webhook",
+        **{
+            "pipeline.id": pipeline_id,
+            "github.run_id": str(
+                run.get("id")
+            ),
+        },
+    ):
+
+        logs = ""
+        diff = ""
+
+        # ----------------------------------------------------
+        # Retrieve actual GitHub logs and commit diff
+        # ----------------------------------------------------
+
+        if github.configured():
+
+            try:
+
+                logs = await github.get_workflow_logs(
+                    int(run["id"])
+                )
+
+                if run.get("head_sha"):
+                    diff = await github.get_commit_diff(
+                        run.get("head_sha")
+                    )
+
+            except Exception as exc:
+
+                logs = (
+                    f"Unable to retrieve GitHub logs: {exc}"
+                )
+
+        # ----------------------------------------------------
+        # Run AutoHeal ADK workflow
+        # ----------------------------------------------------
+
+        state = workflow.invoke(
+            {
+                "pipeline_id": pipeline_id,
+
+                "scenario": scenario,
+
+                "github": {
+                    "run_id": run.get("id"),
+                    "name": run.get("name"),
+                    "conclusion": run.get("conclusion"),
+                    "head_sha": run.get("head_sha"),
+                    "branch": run.get("head_branch"),
+                    "html_url": run.get("html_url"),
+                },
+
+                "logs": logs,
+
+                "diff": diff,
+
+                # Initialized now.
+                # Later this will contain the actual
+                # isolated test execution result.
+                "validation_result": {},
+            }
+        )
+
+        runs[pipeline_id] = state
+
+        return {
+            "accepted": True,
+            "pipeline_id": pipeline_id,
+            "decision": state.get(
+                "decision"
+            ),
+            "hitl": state.get(
+                "hitl"
+            ),
+        }
+
+
+# ============================================================
+# HUMAN-IN-THE-LOOP DECISION
+# ============================================================
+
+@app.post("/api/pipelines/{pipeline_id}/decision")
+def hitl_decision(
+    pipeline_id: str,
+    req: DecisionRequest,
+):
+
+    if pipeline_id not in runs:
+        raise HTTPException(
+            404,
+            "Pipeline not found",
+        )
+
+    if req.action not in {
+        "approve",
+        "reject",
+    }:
+        raise HTTPException(
+            400,
+            "action must be approve or reject",
+        )
+
+    state = runs[pipeline_id]
+
+    if req.action == "approve":
+
+        state["hitl"] = {
+            "status": "approved",
+        }
+
+        state["decision"] = (
+            "APPROVED_FOR_RELEASE"
+        )
+
+    else:
+
+        state["hitl"] = {
+            "status": "rejected",
+        }
+
+        state["decision"] = "REJECTED"
+
+    return state

@@ -24,23 +24,13 @@ MAX_DIFF_CHARS = 2500
 
 
 def _clip(value: Any, limit: int) -> str:
-    """Keep agent context bounded while preserving both head and tail evidence."""
+    """Keep agent context bounded while preserving the beginning of the evidence."""
     if value is None:
         return ""
-
     text = str(value)
-
     if len(text) <= limit:
         return text
-
-    head = limit // 2
-    tail = limit - head
-
-    return (
-        text[:head]
-        + "\n...[middle truncated]...\n"
-        + text[-tail:]
-    )
+    return text[:limit] + "\n...[truncated]"
 
 
 _GENERATION_CONFIG = types.GenerateContentConfig(
@@ -478,9 +468,9 @@ def _fallback_fix(logs: str, rca: Any) -> dict[str, Any] | None:
         and isinstance(rca, dict)
         and rca.get("likely_files")
     ):
-        patch = """diff --git a/calculator.py b/calculator.py
---- a/calculator.py
-+++ b/calculator.py
+        patch = """diff --git a/sample-repo/calculator.py b/sample-repo/calculator.py
+--- a/sample-repo/calculator.py
++++ b/sample-repo/calculator.py
 @@ -1,2 +1,2 @@
  def add(a, b):
 -    return a - b

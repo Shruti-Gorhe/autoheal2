@@ -1,0 +1,10 @@
+diff --git a/sample-repo/calculator.py b/sample-repo/calculator.py
+index 8791e84..19cf2a0 100644
+--- a/sample-repo/calculator.py
++++ b/sample-repo/calculator.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
+\ No newline at end of file
++    return a + b
+\ No newline at end of file
